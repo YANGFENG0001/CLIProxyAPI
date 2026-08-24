@@ -3,12 +3,30 @@ package gemini
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/tidwall/gjson"
 	"google.golang.org/protobuf/encoding/protowire"
 )
+
+func TestSanitizeAntigravityFunctionResponseResults_RemovesDuplicateObjectKeys(t *testing.T) {
+	input := []byte(`{"request":{"contents":[{"role":"user","parts":[{"functionResponse":{"name":"read_resources","response":{"result":{"resources":[{"name":"create-new-file","description":"first","description":"second","mimeType":"text/markdown"}]}}}}]}]}}`)
+
+	out := sanitizeAntigravityFunctionResponseResults(input)
+	result := gjson.GetBytes(out, "request.contents.0.parts.0.functionResponse.response.result")
+	if !result.Exists() {
+		t.Fatal("function response result is missing")
+	}
+
+	if result.Get("resources.0.description").String() != "second" {
+		t.Fatalf("description = %q, want last duplicate value", result.Get("resources.0.description").String())
+	}
+	if strings.Count(string(result.Raw), `"description"`) != 1 {
+		t.Fatalf("duplicate description key remains: %s", result.Raw)
+	}
+}
 
 func TestConvertGeminiRequestToAntigravity_ReplacesClientSignatureOnFunctionCall(t *testing.T) {
 	// Client signatures on Gemini function calls are not portable to Antigravity.

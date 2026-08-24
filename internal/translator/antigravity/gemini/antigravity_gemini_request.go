@@ -53,6 +53,14 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 	rawJSON = fixedJSON
 
+	// Antigravity converts functionResponse.response.result into a protobuf
+	// Struct. OpenAI Responses tool outputs can contain raw JSON objects with
+	// duplicate keys (for example an MCP/Figma resource list with repeated
+	// "description" fields). JSON permits many parsers to accept this, but a
+	// protobuf map rejects it as "Repeated map key". Normalize only this
+	// Antigravity-specific payload field; do not round-trip the whole request.
+	rawJSON = sanitizeAntigravityFunctionResponseResults(rawJSON)
+
 	if systemInstructionResult := util.GetGJSONBytesNoCopy(rawJSON, "request.system_instruction"); systemInstructionResult.Exists() {
 		rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.systemInstruction", []byte(systemInstructionResult.Raw))
 		rawJSON, _ = sjson.DeleteBytes(rawJSON, "request.system_instruction")
@@ -631,6 +639,53 @@ func logAntigravityClaudeGeminiSignatureSanitize(modelName, action, reason strin
 		"detected_provider": string(signature.DetectSignatureProviderForBlock(rawSignature, signature.SignatureBlockKindClaudeThinking)),
 	}
 	log.WithFields(fields).Debug("antigravity gemini translator: sanitized Claude target thoughtSignature before upstream")
+}
+
+// sanitizeAntigravityFunctionResponseResults canonicalizes object/array JSON
+// stored in functionResponse.response.result. The canonicalization is scoped to
+// tool results because those values are the only fields that Antigravity turns
+// into protobuf Struct maps and therefore the only fields affected by duplicate
+// JSON object keys from upstream tool bridges.
+func sanitizeAntigravityFunctionResponseResults(input []byte) []byte {
+	contents := util.GetGJSONBytesNoCopy(input, "request.contents")
+	if !contents.IsArray() {
+		return input
+	}
+
+	result := input
+	for contentIndex, content := range contents.Array() {
+		parts := content.Get("parts")
+		if !parts.IsArray() {
+			continue
+		}
+		for partIndex, part := range parts.Array() {
+			for _, responseField := range []string{"functionResponse", "function_response"} {
+				response := part.Get(responseField)
+				if !response.Exists() {
+					continue
+				}
+				resultValue := response.Get("response.result")
+				if !resultValue.Exists() || (!resultValue.IsObject() && !resultValue.IsArray()) || !json.Valid([]byte(resultValue.Raw)) {
+					continue
+				}
+
+				var normalized any
+				if err := json.Unmarshal([]byte(resultValue.Raw), &normalized); err != nil {
+					continue
+				}
+				normalizedRaw, err := json.Marshal(normalized)
+				if err != nil || string(normalizedRaw) == resultValue.Raw {
+					continue
+				}
+
+				path := fmt.Sprintf("request.contents.%d.parts.%d.%s.response.result", contentIndex, partIndex, responseField)
+				if updated, ok := sjson.SetRawBytes(result, path, normalizedRaw); ok == nil {
+					result = updated
+				}
+			}
+		}
+	}
+	return result
 }
 
 // FunctionCallGroup represents a group of function calls and their responses
