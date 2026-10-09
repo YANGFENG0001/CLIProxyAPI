@@ -57,6 +57,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		return nil, errProject
 	}
 	payload = geminiToAntigravity(modelName, payload, projectID, derivedSessionIDs...)
+	payload = ensureAntigravityServerSideToolInvocations(payload)
 
 	// Cap maxOutputTokens to model's max_completion_tokens from registry
 	if maxOut := gjson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxOut.Exists() && maxOut.Type == gjson.Number {
@@ -500,6 +501,81 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string, der
 		template, _ = sjson.DeleteBytes(template, "toolConfig")
 	}
 	return template
+}
+
+// antigravityBuiltInToolKeys lists the Gemini built-in (server-executed) tool
+// keys that Antigravity accepts inside request.tools.
+var antigravityBuiltInToolKeys = []string{
+	"googleSearch",
+	"googleSearchRetrieval",
+	"enterpriseWebSearch",
+	"googleMaps",
+	"codeExecution",
+	"urlContext",
+	"fileSearch",
+	"computerUse",
+	"retrieval",
+}
+
+// ensureAntigravityServerSideToolInvocations enables the Gemini 3 tool context
+// loop when a request mixes built-in tools with function calling.
+//
+// Gemini 3 rejects that combination with HTTP 400 "Please enable
+// tool_config.include_server_side_tool_invocations to use Built-in tools with
+// Function calling." until the flag is set. Requests that carry only built-in
+// tools or only function declarations are returned unchanged, so every
+// existing request keeps its current payload byte for byte.
+func ensureAntigravityServerSideToolInvocations(payload []byte) []byte {
+	tools := util.GetGJSONBytesNoCopy(payload, "request.tools")
+	if !tools.IsArray() {
+		return payload
+	}
+
+	hasBuiltInTool := false
+	hasFunctionDeclarations := false
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		if !tool.IsObject() {
+			return true
+		}
+		if !hasFunctionDeclarations {
+			hasFunctionDeclarations = antigravityToolHasFunctionDeclarations(tool)
+		}
+		if !hasBuiltInTool {
+			for _, key := range antigravityBuiltInToolKeys {
+				if tool.Get(key).Exists() {
+					hasBuiltInTool = true
+					break
+				}
+			}
+		}
+		return !(hasBuiltInTool && hasFunctionDeclarations)
+	})
+	if !hasBuiltInTool || !hasFunctionDeclarations {
+		return payload
+	}
+	if gjson.GetBytes(payload, "request.toolConfig.includeServerSideToolInvocations").Bool() {
+		return payload
+	}
+
+	updated, errSet := sjson.SetBytes(payload, "request.toolConfig.includeServerSideToolInvocations", true)
+	if errSet != nil {
+		log.Debugf("antigravity: failed to enable server-side tool invocations: %v", errSet)
+		return payload
+	}
+	return updated
+}
+
+// antigravityToolHasFunctionDeclarations reports whether a Gemini tool object
+// carries at least one function declaration. Both the camelCase and the
+// snake_case spellings reach the executor depending on the inbound protocol.
+func antigravityToolHasFunctionDeclarations(tool gjson.Result) bool {
+	for _, key := range []string{"functionDeclarations", "function_declarations"} {
+		declarations := tool.Get(key)
+		if declarations.IsArray() && declarations.Get("#").Int() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func generateRequestID() string {
